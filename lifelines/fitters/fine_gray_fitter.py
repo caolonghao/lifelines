@@ -579,6 +579,42 @@ class FineGrayFitter(SemiParametricRegressionFitter):
 
         return weights_matrix
 
+    def _compute_ipcw_weights_vectorized(
+        self,
+        competing_indices: np.ndarray,
+        failure_idx: int,
+        censoring_groups: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Vectorized computation of IPCW weights for competing events.
+
+        Parameters
+        ----------
+        competing_indices : ndarray
+            Indices of subjects with competing events
+        failure_idx : int
+            Index in the sorted time array corresponding to current failure time
+        censoring_groups : ndarray
+            Censoring group assignments for all subjects
+
+        Returns
+        -------
+        ipcw_weights : ndarray
+            IPCW weights for each competing event subject
+        """
+        n_competing = len(competing_indices)
+        ipcw_weights = np.zeros(n_competing)
+
+        for idx, i in enumerate(competing_indices):
+            group_idx = censoring_groups[i] - 1
+            G_at_failure = self._censoring_weights_matrix[group_idx, failure_idx]
+            G_at_competing = self._censoring_weights_matrix[group_idx, i]
+
+            if G_at_competing > 0:
+                ipcw_weights[idx] = G_at_failure / G_at_competing
+
+        return ipcw_weights
+
     def _newton_raphson_fine_gray(
         self,
         X: np.ndarray,
@@ -789,6 +825,8 @@ class FineGrayFitter(SemiParametricRegressionFitter):
         This implements the Fine-Gray partial likelihood with IPCW weighting,
         following the algorithm in R's cmprsk::crr function (crrfsv subroutine).
 
+        Vectorized version for improved performance.
+
         Returns
         -------
         log_lik : float
@@ -814,10 +852,16 @@ class FineGrayFitter(SemiParametricRegressionFitter):
             # No events of interest
             return 0.0, gradient, hessian
 
-        # Create index mapping for unique failure times
-        failure_time_indices = {t: idx for idx, t in enumerate(unique_failure_times[::-1])}
+        # Precompute linear predictors and exp values (major optimization)
+        linear_pred = dot(X, beta)  # Shape: (n,)
+        exp_linear_pred = exp(linear_pred)  # Shape: (n,)
 
-        # Process each failure time (from latest to earliest, as in Fortran code)
+        # Precompute X weighted by exp(linear_pred) * W_external
+        # This will be reused for gradient and hessian calculations
+        exp_lp_W = exp_linear_pred * W_external  # Shape: (n,)
+        X_weighted = X * exp_lp_W[:, np.newaxis]  # Shape: (n, d)
+
+        # Process each failure time (from latest to earliest)
         for failure_time in unique_failure_times:
             # Find all subjects who have event of interest at this time
             at_failure = (T == failure_time) & (E == 1)
@@ -826,77 +870,66 @@ class FineGrayFitter(SemiParametricRegressionFitter):
             if n_failures_at_time == 0:
                 continue
 
-            # Compute sum over failures at this time: sum(X_i * beta * W_i)
-            X_at_failure = X[at_failure, :]
-            W_at_failure = W_external[at_failure]
-
-            linear_pred_failures = dot(X_at_failure, beta)
-            weighted_lp_failures = (linear_pred_failures * W_at_failure).sum()
-
-            # Contribution from failures: -sum(X*beta) (negative for pseudo-likelihood)
+            # Contribution from failures: -sum(X*beta * W)
+            weighted_lp_failures = (linear_pred[at_failure] * W_external[at_failure]).sum()
             log_lik -= weighted_lp_failures
 
             # Gradient contribution from failures: -sum(X_i * W_i)
-            gradient -= dot(W_at_failure, X_at_failure)
+            gradient -= dot(W_external[at_failure], X[at_failure, :])
 
-            # Compute risk set contribution
-            # Risk set includes:
-            # 1. All subjects still at risk (T >= failure_time)
-            # 2. Subjects with competing events BEFORE this failure time (with IPCW weights)
+            # Vectorized risk set computation
+            # Split into two groups: at risk vs competing events before failure_time
 
-            risk_set_sum = 0.0
-            risk_set_gradient = np.zeros(d)
-            risk_set_hessian_component = np.zeros((d, d))
+            # Group 1: Still at risk (T >= failure_time)
+            at_risk = T >= failure_time
 
-            for i in range(n):
-                if T[i] < failure_time:
-                    # Subject has event/censoring before this failure time
-                    if E[i] <= 1:
-                        # Censored or event of interest - not in risk set
-                        continue
-                    else:
-                        # Competing event - remains in risk set with IPCW weight
-                        # Weight = exp(X*beta) * G(t_failure) / G(t_competing)
-                        group_idx = censoring_groups[i] - 1
-                        # Find index for current failure time
-                        failure_idx = np.searchsorted(T, failure_time)
-                        G_at_failure = self._censoring_weights_matrix[group_idx, failure_idx]
-                        G_at_competing = self._censoring_weights_matrix[group_idx, i]
+            # Group 2: Competing events before failure_time
+            competing_before = (T < failure_time) & (E == 2)
 
-                        if G_at_competing > 0:
-                            ipcw_weight = G_at_failure / G_at_competing
-                        else:
-                            ipcw_weight = 0.0
+            # Initialize risk contributions
+            risk_contributions = np.zeros(n)
 
-                        linear_pred = dot(X[i, :], beta)
-                        risk_contribution = exp(linear_pred) * W_external[i] * ipcw_weight
+            # At-risk subjects: contribution = exp(X*beta) * W
+            risk_contributions[at_risk] = exp_lp_W[at_risk]
 
-                else:
-                    # Subject still at risk (T[i] >= failure_time)
-                    linear_pred = dot(X[i, :], beta)
-                    risk_contribution = exp(linear_pred) * W_external[i]
+            # Competing events: contribution = exp(X*beta) * W * IPCW_weight
+            if competing_before.any():
+                # Get indices of competing events
+                comp_indices = np.where(competing_before)[0]
 
-                # Accumulate risk set sums
-                risk_set_sum += risk_contribution
-                risk_set_gradient += risk_contribution * X[i, :]
+                # Find index for current failure time in sorted T array
+                failure_idx = np.searchsorted(T, failure_time)
 
-                # For Hessian: outer product weighted by risk contribution
-                # This computes sum_i w_i * exp(X_i*beta) * X_i * X_i^T
-                risk_set_hessian_component += risk_contribution * np.outer(X[i, :], X[i, :])
+                # Batch compute IPCW weights
+                ipcw_weights = self._compute_ipcw_weights_vectorized(
+                    comp_indices, failure_idx, censoring_groups
+                )
 
-            # Log-likelihood contribution from risk set
+                # Apply weights
+                risk_contributions[comp_indices] = exp_lp_W[comp_indices] * ipcw_weights
+
+            # Sum of risk contributions
+            risk_set_sum = risk_contributions.sum()
+
             if risk_set_sum > 0:
+                # Log-likelihood contribution
                 log_lik += n_failures_at_time * log(risk_set_sum)
 
-                # Gradient contribution: n_failures * (sum_risk X_i*w_i) / (sum_risk w_i)
+                # Gradient: vectorized computation
+                # sum_i risk_contribution_i * X_i = X.T @ risk_contributions
+                risk_set_gradient = dot(risk_contributions, X)
                 gradient += (n_failures_at_time / risk_set_sum) * risk_set_gradient
 
-                # Hessian contribution (observed information)
-                # H = n_failures * [ (sum w_i X_i X_i^T) / (sum w_i)
-                #                    - (sum w_i X_i)(sum w_i X_i)^T / (sum w_i)^2 ]
+                # Hessian: vectorized computation
+                # First term: sum_i risk_contribution_i * X_i * X_i^T
+                X_risk_weighted = X * risk_contributions[:, np.newaxis]  # (n, d)
+                risk_set_hessian = dot(X_risk_weighted.T, X)  # (d, d)
+
+                # Second term: (sum_i risk_contribution_i * X_i) * (sum_j risk_contribution_j * X_j)^T
                 avg_X = risk_set_gradient / risk_set_sum
+
                 hessian += (n_failures_at_time / risk_set_sum) * (
-                    risk_set_hessian_component - np.outer(avg_X, avg_X) * risk_set_sum
+                    risk_set_hessian - risk_set_sum * np.outer(avg_X, avg_X)
                 )
 
         return log_lik, gradient, hessian
@@ -918,6 +951,8 @@ class FineGrayFitter(SemiParametricRegressionFitter):
         The baseline subdistribution hazard jumps at each event time are:
         λ_0(t_j) = (# failures at t_j) / (sum of weighted risks at t_j)
 
+        Vectorized version for improved performance.
+
         These are stored and used for predictions.
         """
         n, d = X.shape
@@ -938,40 +973,46 @@ class FineGrayFitter(SemiParametricRegressionFitter):
             )
             return
 
-        # Compute hazard jumps at each failure time
+        # Precompute exp(X*beta) * W_external (major optimization)
+        linear_pred = dot(X, beta)
+        exp_lp_W = exp(linear_pred) * W_external
+
+        # Compute hazard jumps at each failure time (vectorized)
         hazard_jumps = []
 
         for failure_time in unique_failure_times:
             # Count failures at this time
             n_failures = ((T == failure_time) & (E == 1)).sum()
 
-            # Compute risk set sum
-            risk_set_sum = 0.0
+            # Vectorized risk set computation
+            # At-risk subjects: T >= failure_time
+            at_risk = T >= failure_time
 
-            for i in range(n):
-                if T[i] < failure_time:
-                    if E[i] <= 1:
-                        continue
-                    else:
-                        # Competing event with IPCW weight
-                        group_idx = censoring_groups[i] - 1
-                        failure_idx = np.searchsorted(T, failure_time)
-                        G_at_failure = self._censoring_weights_matrix[group_idx, failure_idx]
-                        G_at_competing = self._censoring_weights_matrix[group_idx, i]
+            # Competing events before failure_time
+            competing_before = (T < failure_time) & (E == 2)
 
-                        if G_at_competing > 0:
-                            ipcw_weight = G_at_failure / G_at_competing
-                        else:
-                            ipcw_weight = 0.0
+            # Initialize risk contributions
+            risk_contributions = np.zeros(n)
 
-                        linear_pred = dot(X[i, :], beta)
-                        risk_set_sum += exp(linear_pred) * W_external[i] * ipcw_weight
-                else:
-                    # Still at risk
-                    linear_pred = dot(X[i, :], beta)
-                    risk_set_sum += exp(linear_pred) * W_external[i]
+            # At-risk subjects
+            risk_contributions[at_risk] = exp_lp_W[at_risk]
 
-            # Hazard jump
+            # Competing events with IPCW weights
+            if competing_before.any():
+                comp_indices = np.where(competing_before)[0]
+                failure_idx = np.searchsorted(T, failure_time)
+
+                # Batch compute IPCW weights
+                ipcw_weights = self._compute_ipcw_weights_vectorized(
+                    comp_indices, failure_idx, censoring_groups
+                )
+
+                # Apply weights
+                risk_contributions[comp_indices] = exp_lp_W[comp_indices] * ipcw_weights
+
+            # Sum and compute hazard jump
+            risk_set_sum = risk_contributions.sum()
+
             if risk_set_sum > 0:
                 jump = n_failures / risk_set_sum
             else:
