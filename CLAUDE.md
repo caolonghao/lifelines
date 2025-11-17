@@ -47,6 +47,13 @@
 │   │   └── printer.py             # Formatted output
 │   ├── datasets/                  # Sample datasets (28+ CSV/DAT files)
 │   │   └── __init__.py            # Dataset loader functions
+│   ├── cmprsk/                    # R package for competing risks (dev branch only)
+│   │   ├── R/                     # R source code
+│   │   ├── src/                   # Fortran source code
+│   │   ├── man/                   # R documentation files
+│   │   ├── tests/                 # R tests
+│   │   ├── DESCRIPTION            # R package metadata
+│   │   └── NAMESPACE              # R package exports
 │   ├── tests/                     # Test suite (9 modules)
 │   │   ├── test_estimation.py    # Main fitter tests
 │   │   ├── test_statistics.py
@@ -623,6 +630,203 @@ When editing large files, be aware of their size:
 - **Minimum:** Python 3.9
 - **Tested:** 3.9, 3.10, 3.11, 3.12
 - **CI:** All versions tested on ubuntu-latest
+
+## Dev Branch: cmprsk R Package for Competing Risks
+
+**Note:** This section applies only to the `dev` branch.
+
+The `dev` branch contains an R package `cmprsk` in the `lifelines/cmprsk/` directory. This is a reference implementation of competing risks analysis methods in R.
+
+### Package Overview
+
+**cmprsk** (Competing Risks) is an R package version 2.2-12 by Bob Gray that provides:
+- Estimation, testing, and regression modeling of subdistribution functions in competing risks
+- Implementation of methods described in two seminal papers:
+  - **Gray (1988)**: "A class of K-sample tests for comparing the cumulative incidence of a competing risk" (Annals of Statistics)
+  - **Fine & Gray (1999)**: "A proportional hazards model for the subdistribution of a competing risk" (JASA)
+
+### Directory Structure
+
+```
+lifelines/cmprsk/
+├── R/
+│   └── cmprsk.R              # Main R source code (534 lines)
+├── src/                      # Fortran source code for performance
+│   ├── crr.f                 # CRR model implementation (577 lines)
+│   ├── cincsub.f             # Cumulative incidence subroutines (105 lines)
+│   ├── crstm.f               # Competing risks test statistics (256 lines)
+│   └── tpoi.f                # Time point interpolation (34 lines)
+├── man/                      # R documentation (.Rd files)
+│   ├── crr.Rd                # Competing risks regression docs
+│   ├── cuminc.Rd             # Cumulative incidence docs
+│   ├── predict.crr.Rd        # Prediction method docs
+│   ├── summary.crr.Rd        # Summary method docs
+│   ├── plot.cuminc.Rd        # Plotting method docs
+│   └── ...                   # Other documentation files
+├── tests/
+│   ├── test.R                # R test script
+│   ├── test.Rout.save        # Expected test output
+│   ├── Rplots.pdf            # Test plots (PDF)
+│   └── Rplots.ps             # Test plots (PostScript)
+├── DESCRIPTION               # Package metadata
+├── NAMESPACE                 # Package exports and imports
+├── COPYING                   # GPL license (≥2)
+└── MD5                       # MD5 checksums
+```
+
+### Main Functions
+
+#### 1. **crr()** - Competing Risks Regression
+
+Fits the Fine-Gray proportional subdistribution hazards model.
+
+**Key Parameters:**
+- `ftime`: Failure/censoring times
+- `fstatus`: Status indicator (unique codes for each failure type + censoring)
+- `cov1`: Fixed covariates matrix
+- `cov2`: Time-varying covariates (multiplied by time functions)
+- `tf`: Time function for cov2
+- `cengroup`: Censoring group indicator
+- `failcode`: Code for failure type of interest (default: 1)
+- `cencode`: Code for censored observations (default: 0)
+
+**Implementation Details:**
+- Uses Newton-Raphson optimization
+- Calls Fortran subroutines for numerical computation:
+  - `crrfsv`: Function, score, and variance computation
+  - `crrf`: Function evaluation only
+  - `crrvv`: Variance-covariance matrix
+  - `crrsr`: Score residuals
+  - `crrfit`: Baseline subdistribution hazard jumps
+- Supports time-varying effects via `cov2` and `tf` parameters
+- Estimates censoring distribution separately within cengroups using Kaplan-Meier
+
+**Returns:** `crr` object with:
+- `coef`: Regression coefficients
+- `loglik`: Log pseudo-likelihood
+- `var`: Variance-covariance matrix
+- `res`: Score residuals
+- `uftime`: Unique failure times
+- `bfitj`: Baseline hazard jumps (for predictions)
+- `converged`: Convergence indicator
+
+#### 2. **cuminc()** - Cumulative Incidence Analysis
+
+Estimates cumulative incidence functions and performs tests across groups.
+
+**Key Parameters:**
+- `ftime`: Failure times
+- `fstatus`: Failure type codes
+- `group`: Group variable for comparisons
+- `strata`: Stratification variable for tests
+- `rho`: Power of weight function (default: 0)
+- `cencode`: Censoring code (default: 0)
+
+**Implementation Details:**
+- Calls Fortran subroutine `cinc` for cumulative incidence estimation
+- Uses `crstm` for test statistics (Gray's K-sample test)
+- Estimates computed separately for each group × cause combination
+- Tests compare subdistributions across groups using weighted statistics
+
+**Returns:** List with:
+- Components for each group-cause combination containing:
+  - `time`: Time points
+  - `est`: Cumulative incidence estimates
+  - `var`: Variance estimates
+- `Tests`: Chi-square test statistics and p-values (if multiple groups)
+
+#### 3. Supporting Functions
+
+- **`predict.crr()`**: Estimate subdistributions for new covariate values
+- **`summary.crr()`**: Detailed regression results with confidence intervals
+- **`plot.cuminc()`**: Visualize cumulative incidence curves
+- **`plot.predict.crr()`**: Plot predicted subdistributions
+- **`timepoints()`**: Extract estimates at specific time points
+- **`print.crr()`**, **`print.cuminc()`**: Print methods
+
+### Fortran Source Code
+
+The package uses Fortran for computational efficiency:
+
+1. **crr.f** (577 lines): Core CRR model computations
+   - Function evaluation
+   - Score vector and information matrix
+   - Variance-covariance estimation
+   - Score residuals
+   - Baseline hazard jumps
+
+2. **cincsub.f** (105 lines): Cumulative incidence subroutine
+   - Non-parametric CIF estimation
+   - Variance calculations using Aalen's method
+
+3. **crstm.f** (256 lines): Competing risks test statistics
+   - Implements Gray's K-sample test
+   - Stratified tests
+   - Weighted statistics
+
+4. **tpoi.f** (34 lines): Time point interpolation utility
+
+### Dependencies
+
+- **R** (≥ 3.0.0)
+- **survival** package (for Kaplan-Meier censoring distribution estimation)
+
+### Purpose in lifelines Repository
+
+This R package serves as a **reference implementation** for competing risks methods. It can be used to:
+
+1. **Validate** Python implementations of competing risks models
+2. **Compare** results between R and Python
+3. **Benchmark** performance and numerical accuracy
+4. **Reference** algorithmic details from the original implementation
+5. **Test** edge cases and verify behavior
+
+### Integration Notes
+
+**Important:** The cmprsk package is written in R and Fortran, not Python. It is **not directly integrated** into the lifelines Python package. Instead, it exists as:
+
+- A reference for implementing similar methods in Python
+- A validation tool for comparing results
+- Documentation of the canonical implementation
+
+If you need to run or test this R package:
+
+```bash
+# Install R (if not already installed)
+# Build the package
+R CMD build lifelines/cmprsk/
+
+# Install the package
+R CMD INSTALL cmprsk_2.2-12.tar.gz
+
+# Or install in R
+install.packages("cmprsk")  # from CRAN
+
+# Load and use
+library(cmprsk)
+?crr
+?cuminc
+```
+
+### Key References
+
+1. **Gray RJ (1988)** "A class of K-sample tests for comparing the cumulative incidence of a competing risk." *Annals of Statistics* 16:1141-1154. DOI: 10.1214/aos/1176350951
+
+2. **Fine JP and Gray RJ (1999)** "A proportional hazards model for the subdistribution of a competing risk." *Journal of the American Statistical Association* 94:496-509. DOI: 10.1080/01621459.1999.10474144
+
+3. **Aalen O (1978)** "Nonparametric estimation of partial transition probabilities in multiple decrement models." *Annals of Statistics* 6:534-545.
+
+### For AI Assistants
+
+When working with competing risks in the lifelines Python codebase:
+
+1. **Reference the R implementation** to understand algorithm details
+2. **Do not modify** the cmprsk R package - it's a reference implementation
+3. **Compare outputs** when implementing Python equivalents
+4. **Check numerical accuracy** against the Fortran/R results
+5. **Study the Fortran code** for optimization techniques and numerical methods
+
+The R package is licensed under **GPL (≥ 2)**, while lifelines itself is MIT licensed. Be mindful of licensing implications if adapting code.
 
 ## Contributing Workflow
 
