@@ -36,3 +36,5 @@ docs/_build/
 # mypy and tests
 .mypy_cache/
 benchmarks/
+
+.DS_Store
